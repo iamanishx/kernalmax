@@ -2,4 +2,5 @@
 
 > `playground` is token generated examples to grasp cuTeDSL quickly 
 
-the `/tutorial` includes examples of the cuTeDSL primitives.
+`/tutorial` includes examples of the cuTeDSL primitives.
+`/general_kernals` includes various small implementation of kernals 

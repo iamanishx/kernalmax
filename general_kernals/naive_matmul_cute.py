@@ -11,9 +11,7 @@ BLOCK_M = 128
 BLOCK_N = 128
 BLOCK_K = 8
 
-# ---- Thread layout of the tiled MMA ------------------------------------------
-# 16x16 = 256 threads. Each thread accumulates a small sub-block of the
-# BLOCK_M x BLOCK_N output tile in registers.
+
 NUM_THREADS = 16 * 16
 
 
@@ -69,7 +67,6 @@ class SimpleGemm:
         for k in cutlass.range(k_tiles):
             tCrA = thr_mma.partition_A(gA[None, None, k])
             tCrB = thr_mma.partition_B(gB[None, None, k])
-            # acc += A_tile @ B_tile
             cute.gemm(tiled_mma, acc, tCrA, tCrB, acc)
 
         copy_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(),
