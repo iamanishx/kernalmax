@@ -21,9 +21,9 @@ class GemmTcSmemV2:
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, _ = cute.arch.block_idx()
 
-        gA = cute.local_tile(mA, (BM, BK), (bidx, None))   # (BM, BK, ktiles)
-        gB = cute.local_tile(mB, (BN, BK), (bidy, None))   # (BN, BK, ktiles)
-        gC = cute.local_tile(mC, (BM, BN), (bidx, bidy))   # (BM, BN)
+        gA = cute.local_tile(mA, (BM, BK), (bidx, None))
+        gB = cute.local_tile(mB, (BN, BK), (bidy, None))
+        gC = cute.local_tile(mC, (BM, BN), (bidx, bidy))
 
         smem = cutlass.utils.SmemAllocator()
         sA = smem.allocate_tensor(cutlass.Float16, cute.make_layout((BM, BK)),
