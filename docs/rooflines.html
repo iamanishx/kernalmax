@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rooflines, Intensity & the 240 Rule</title>
+<style>
+  :root{
+    --ink:#1f2430; --muted:#5b6472; --line:#e5e8ee; --bg:#ffffff; --panel:#f8f9fb;
+    --compute:#4f46e5; --compute-bg:#eef0fe;
+    --memory:#f59e0b; --memory-bg:#fef4e6;
+    --network:#8b5cf6; --network-bg:#f3eefe;
+    --good:#10b981; --good-bg:#e7f8f1;
+    --bad:#ef4444; --bad-bg:#fdecec;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.6;font-size:16px}
+  .wrap{max-width:920px;margin:0 auto;padding:40px 24px 80px}
+  header{border-bottom:3px solid var(--compute);padding-bottom:20px;margin-bottom:12px}
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:15px}
+  h2{font-size:22px;margin:44px 0 12px;padding-left:12px;border-left:5px solid var(--compute)}
+  h3{font-size:17px;margin:22px 0 8px}
+  p{margin:10px 0}
+  code{font-family:"SF Mono",Menlo,Consolas,monospace;background:var(--panel);
+    padding:2px 6px;border-radius:5px;font-size:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:18px 20px;margin:16px 0}
+  .formula{font-family:"SF Mono",Menlo,Consolas,monospace;font-size:16px;
+    background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px 18px;
+    margin:12px 0;text-align:center;overflow-x:auto}
+  .tag{display:inline-block;font-size:12px;font-weight:700;padding:2px 9px;border-radius:20px;
+    vertical-align:middle}
+  .t-compute{background:var(--compute-bg);color:var(--compute)}
+  .t-memory{background:var(--memory-bg);color:var(--memory)}
+  .t-network{background:var(--network-bg);color:var(--network)}
+  .t-good{background:var(--good-bg);color:var(--good)}
+  .t-bad{background:var(--bad-bg);color:var(--bad)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media(max-width:640px){.grid2{grid-template-columns:1fr}}
+  .mini{border-radius:12px;padding:16px;border:1px solid var(--line)}
+  .mini h4{margin:0 0 6px;font-size:15px}
+  .mini.compute{background:var(--compute-bg);border-color:#d6d9fb}
+  .mini.memory{background:var(--memory-bg);border-color:#f6e2c0}
+  .mini.network{background:var(--network-bg);border-color:#e3d6fb}
+  table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:9px 12px;text-align:left}
+  th{background:var(--panel);font-weight:700}
+  .dim{font-weight:800}
+  .dB{color:var(--compute)} .dD{color:var(--memory)} .dF{color:var(--network)}
+  .note{font-size:14px;color:var(--muted)}
+  .big{font-size:18px}
+  .callout{border-left:5px solid var(--good);background:var(--good-bg);
+    padding:12px 16px;border-radius:0 10px 10px 0;margin:16px 0}
+  .callout.warn{border-color:var(--memory);background:var(--memory-bg)}
+  svg{max-width:100%;height:auto;display:block;margin:10px auto}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;font-size:13px;margin-top:8px;justify-content:center}
+  .legend span{display:inline-flex;align-items:center;gap:6px}
+  .sw{width:14px;height:14px;border-radius:3px;display:inline-block}
+  .kbd{font-family:monospace;background:#fff;border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+  ul{margin:8px 0}
+  li{margin:4px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Rooflines, Arithmetic Intensity &amp; the 240 Rule</h1>
+  <div class="sub">A visual walk through the JAX Scaling Book roofline math &mdash; matmul costs, memory vs compute bound, the batch dimension, and distributed communication.</div>
+</header>
+
+<!-- ============ 1 ============ -->
+<h2>1 &middot; What a matmul costs</h2>
+<p>The example op is <code>X * Y &rarr; Z</code>, all in <b>bf16</b> (2 bytes per number):</p>
+
+<svg viewBox="0 0 640 200" role="img" aria-label="matmul shapes">
+  <!-- X -->
+  <rect x="20" y="60" width="120" height="90" fill="var(--compute-bg)" stroke="var(--compute)" stroke-width="2" rx="6"/>
+  <text x="80" y="105" text-anchor="middle" font-size="20" font-weight="700" fill="var(--ink)">X</text>
+  <text x="80" y="45" text-anchor="middle" font-size="13" fill="var(--muted)">[B, D]</text>
+  <text x="80" y="170" text-anchor="middle" font-size="12" fill="var(--compute)">B rows (tokens)</text>
+  <text x="10" y="110" text-anchor="middle" font-size="11" fill="var(--muted)" transform="rotate(-90 10 110)">B</text>
+  <!-- times -->
+  <text x="165" y="112" text-anchor="middle" font-size="24" fill="var(--muted)">&times;</text>
+  <!-- Y -->
+  <rect x="195" y="40" width="110" height="130" fill="var(--memory-bg)" stroke="var(--memory)" stroke-width="2" rx="6"/>
+  <text x="250" y="112" text-anchor="middle" font-size="20" font-weight="700" fill="var(--ink)">Y</text>
+  <text x="250" y="28" text-anchor="middle" font-size="13" fill="var(--muted)">[D, F]</text>
+  <text x="250" y="190" text-anchor="middle" font-size="12" fill="var(--memory)">the weights</text>
+  <!-- equals -->
+  <text x="330" y="112" text-anchor="middle" font-size="24" fill="var(--muted)">=</text>
+  <!-- Z -->
+  <rect x="360" y="60" width="120" height="90" fill="var(--good-bg)" stroke="var(--good)" stroke-width="2" rx="6"/>
+  <text x="420" y="112" text-anchor="middle" font-size="20" font-weight="700" fill="var(--ink)">Z</text>
+  <text x="420" y="45" text-anchor="middle" font-size="13" fill="var(--muted)">[B, F]</text>
+  <text x="420" y="170" text-anchor="middle" font-size="12" fill="var(--good)">the output</text>
+  <!-- costs -->
+  <text x="565" y="70" text-anchor="middle" font-size="12" fill="var(--memory)" font-weight="700">load</text>
+  <text x="565" y="88" text-anchor="middle" font-size="13" fill="var(--ink)">2DF + 2BD</text>
+  <text x="565" y="112" text-anchor="middle" font-size="12" fill="var(--compute)" font-weight="700">compute</text>
+  <text x="565" y="130" text-anchor="middle" font-size="13" fill="var(--ink)">2BDF</text>
+  <text x="565" y="154" text-anchor="middle" font-size="12" fill="var(--good)" font-weight="700">write</text>
+  <text x="565" y="172" text-anchor="middle" font-size="13" fill="var(--ink)">2BF</text>
+</svg>
+
+<div class="grid2">
+  <div class="mini memory">
+    <h4>Bytes loaded <span class="tag t-memory">2DF + 2BD</span></h4>
+    <p class="note">Read both inputs. Each element is bf16 = <b>2 bytes</b>.</p>
+    <code>load Y: D&times;F &times; 2 = 2DF</code><br>
+    <code>load X: B&times;D &times; 2 = 2BD</code>
+  </div>
+  <div class="mini compute">
+    <h4>FLOPs <span class="tag t-compute">2BDF</span></h4>
+    <p class="note">Z has B&times;F outputs; each is a length-D dot product.</p>
+    <code>each output = D MACs</code><br>
+    <code>1 MAC = 2 FLOPs (mul + add)</code><br>
+    <code>B&times;F &times; 2D = 2BDF</code>
+  </div>
+</div>
+
+<div class="callout warn">
+  <b>The trap: the two "2"s mean different things.</b><br>
+  In <code>2DF</code>, <code>2BD</code>, <code>2BF</code> &rarr; the 2 = <b>bytes per element</b> (bf16 = 2 bytes).<br>
+  In <code>2BDF</code> &rarr; the 2 = <b>FLOPs per multiply-add</b> (one multiply + one add). Totally unrelated coincidence.
+</div>
+
+<!-- ============ 2 ============ -->
+<h2 style="border-color:var(--memory)">2 &middot; Arithmetic intensity</h2>
+<p>Intensity = how much <span class="tag t-compute">compute</span> you do per <span class="tag t-memory">byte moved</span>. It decides if you are compute-bound or memory-bound.</p>
+
+<div class="formula">
+Intensity = <b style="color:var(--compute)">FLOPs</b> / <b style="color:var(--memory)">bytes</b> =
+2BDF / (2BD + 2DF + 2BF) = <b>BDF / (BD + DF + BF)</b>
+</div>
+
+<div class="grid2">
+  <div class="mini compute">
+    <h4>High intensity <span class="tag t-good">compute-bound</span></h4>
+    <p class="note">Lots of FLOPs per byte. Tensor cores stay busy. This is what you want.</p>
+  </div>
+  <div class="mini memory">
+    <h4>Low intensity <span class="tag t-bad">memory-bound</span></h4>
+    <p class="note">Few FLOPs per byte. Cores sit idle waiting on HBM. The ReLU/RMSNorm situation.</p>
+  </div>
+</div>
+
+<!-- ============ 3 ============ -->
+<h2 style="border-color:var(--good)">3 &middot; The roofline</h2>
+<p>Plot achievable performance vs intensity. Two regions: the sloped <span class="tag t-memory">memory wall</span> and the flat <span class="tag t-compute">compute ceiling</span>. The corner is the crossover intensity.</p>
+
+<svg viewBox="0 0 640 340" role="img" aria-label="roofline chart">
+  <!-- axes -->
+  <line x1="70" y1="290" x2="600" y2="290" stroke="var(--ink)" stroke-width="2"/>
+  <line x1="70" y1="40" x2="70" y2="290" stroke="var(--ink)" stroke-width="2"/>
+  <text x="335" y="325" text-anchor="middle" font-size="13" fill="var(--muted)">Arithmetic intensity (FLOPs / byte) &rarr;</text>
+  <text x="24" y="165" text-anchor="middle" font-size="13" fill="var(--muted)" transform="rotate(-90 24 165)">Performance (FLOP/s) &rarr;</text>
+  <!-- memory-bound slope -->
+  <line x1="70" y1="290" x2="320" y2="90" stroke="var(--memory)" stroke-width="4"/>
+  <!-- compute ceiling -->
+  <line x1="320" y1="90" x2="600" y2="90" stroke="var(--compute)" stroke-width="4"/>
+  <!-- corner dashed -->
+  <line x1="320" y1="90" x2="320" y2="290" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="320" y="308" text-anchor="middle" font-size="12" fill="var(--ink)" font-weight="700">crossover</text>
+  <!-- labels -->
+  <text x="150" y="200" font-size="13" fill="var(--memory)" font-weight="700" transform="rotate(-38 150 200)">memory-bound</text>
+  <text x="430" y="80" font-size="13" fill="var(--compute)" font-weight="700">compute ceiling (peak FLOP/s)</text>
+  <!-- points -->
+  <circle cx="150" cy="170" r="7" fill="var(--memory)"/>
+  <text x="150" y="158" text-anchor="middle" font-size="11" fill="var(--memory)">ReLU / RMSNorm</text>
+  <circle cx="470" cy="90" r="7" fill="var(--compute)"/>
+  <text x="470" y="120" text-anchor="middle" font-size="11" fill="var(--compute)">big matmul (large B)</text>
+</svg>
+<div class="legend">
+  <span><span class="sw" style="background:var(--memory)"></span>memory wall (bandwidth limited)</span>
+  <span><span class="sw" style="background:var(--compute)"></span>compute ceiling (FLOP limited)</span>
+</div>
+
+<!-- ============ 4 ============ -->
+<h2>4 &middot; B, D, F &mdash; not all dimensions are equal</h2>
+<table>
+  <tr><th>Symbol</th><th>Meaning</th><th>Typical size</th><th>Who sets it</th></tr>
+  <tr><td class="dim dB">B</td><td>batch size = number of <b>tokens</b> processed at once (rows of X, Z)</td><td>1 &rarr; ~1000s</td><td class="dB">YOU (runtime choice)</td></tr>
+  <tr><td class="dim dD">D</td><td>model hidden dimension</td><td>&gt; 8000</td><td class="dD">fixed by model</td></tr>
+  <tr><td class="dim dF">F</td><td>feed-forward / output dimension</td><td>&gt; 8000</td><td class="dF">fixed by model</td></tr>
+</table>
+<p><b class="dB">B is the only free variable.</b> It is the row count of the activations, and it means <b>tokens</b>, not requests:</p>
+<div class="card">
+  <code>decode (1 token/step)</code> &rarr; B &asymp; number of concurrent requests (small)<br>
+  <code>prefill / training</code> &rarr; B &asymp; total tokens in the batch (large)<br>
+  <span class="note">2 requests &times; 512 tokens = B of <b>1024 tokens</b>, not B=2 sequences.</span>
+</div>
+
+<h3>B is the weight-reuse factor</h3>
+<p>The weight matrix Y[D,F] must be loaded no matter what. B = how many tokens share that one load.</p>
+<div class="grid2">
+  <div class="mini memory">
+    <h4>B = 1 <span class="tag t-bad">memory-bound</span></h4>
+    <p class="note">Load the entire [D,F] weights &rarr; use them for <b>one</b> token. You just dragged weights across HBM to compute one row.</p>
+  </div>
+  <div class="mini compute">
+    <h4>B = 1000 <span class="tag t-good">compute-bound</span></h4>
+    <p class="note">Load [D,F] once &rarr; reuse for <b>1000</b> tokens. Weights amortized, cores fed.</p>
+  </div>
+</div>
+
+<!-- ============ 5 ============ -->
+<h2 style="border-color:var(--memory)">5 &middot; Why intensity &asymp; B, and the 240 rule</h2>
+<p>When B is small compared to D and F (true: B &lt; 1024, D,F &gt; 8000), the denominator collapses:</p>
+<div class="formula">
+BDF / (BD + DF + BF) &asymp; BDF / DF = <b style="color:var(--compute)">B</b>
+</div>
+<p>So <b>intensity &asymp; B</b>. You cross into compute-bound when intensity beats the hardware's FLOP-to-bandwidth ratio:</p>
+<div class="formula">
+TPU: 1.97e14 FLOP/s &divide; 8.2e11 byte/s = <b>240</b>
+</div>
+<div class="callout">
+  <b>The rule:</b> per-replica batch <span class="kbd">&gt; 240 tokens</span> &rarr; <span class="tag t-good">compute-bound</span>.
+  Below that &rarr; <span class="tag t-bad">memory-bound</span>. (GPUs: ~300, same idea.)
+</div>
+
+<!-- ============ 6 ============ -->
+<h2 style="border-color:var(--network)">6 &middot; "Per-replica" batch</h2>
+<p>Work is split across many chips (data parallelism). Each chip = a <b>replica</b>. The roofline is about <b>one chip</b>, so B means the per-replica token count.</p>
+<svg viewBox="0 0 640 150" role="img" aria-label="per replica split">
+  <rect x="20" y="55" width="180" height="44" rx="8" fill="var(--compute-bg)" stroke="var(--compute)" stroke-width="2"/>
+  <text x="110" y="82" text-anchor="middle" font-size="14" font-weight="700">global batch = 4096 tokens</text>
+  <text x="245" y="82" text-anchor="middle" font-size="22" fill="var(--muted)">&divide; 16</text>
+  <g>
+    <rect x="300" y="30" width="90" height="30" rx="6" fill="var(--good-bg)" stroke="var(--good)" stroke-width="1.5"/>
+    <rect x="300" y="66" width="90" height="30" rx="6" fill="var(--good-bg)" stroke="var(--good)" stroke-width="1.5"/>
+    <rect x="300" y="102" width="90" height="30" rx="6" fill="var(--good-bg)" stroke="var(--good)" stroke-width="1.5"/>
+    <text x="345" y="50" text-anchor="middle" font-size="12">chip: 256</text>
+    <text x="345" y="86" text-anchor="middle" font-size="12">chip: 256</text>
+    <text x="345" y="122" text-anchor="middle" font-size="12">chip: 256</text>
+  </g>
+  <text x="470" y="70" font-size="13" fill="var(--good)" font-weight="700">256 &gt; 240</text>
+  <text x="470" y="90" font-size="12" fill="var(--muted)">&rarr; compute-bound &check;</text>
+</svg>
+
+<!-- ============ 7 ============ -->
+<h2 style="border-color:var(--network)">7 &middot; Distributed roofline &mdash; three times, two bandwidths</h2>
+<p>Across many chips you track <b>three</b> times, and the op is bounded by whichever dominates.</p>
+
+<div class="grid2">
+  <div class="mini compute">
+    <h4><span class="tag t-compute">T_math</span> compute</h4>
+    <div class="formula" style="text-align:left;font-size:13px">FLOPs / (N &times; chip FLOP/s)</div>
+    <p class="note">Total work split across N chips.</p>
+  </div>
+  <div class="mini memory">
+    <h4><span class="tag t-memory">T_mem</span> memory</h4>
+    <div class="formula" style="text-align:left;font-size:13px">HBM bytes / HBM bandwidth</div>
+    <p class="note">On-chip memory &harr; chip. FAST (TB/s).</p>
+  </div>
+</div>
+<div class="mini network" style="margin-top:14px">
+  <h4><span class="tag t-network">T_comms</span> communication</h4>
+  <div class="formula" style="text-align:left;font-size:13px">network bytes / <b>NETWORK bandwidth</b></div>
+  <p class="note">Chip &harr; chip over the interconnect. This is the one people get wrong.</p>
+</div>
+
+<div class="callout warn">
+  <b>Key: T_comms uses the NETWORK bandwidth, not HBM bandwidth.</b> They are different pipes.
+</div>
+
+<table>
+  <tr><th></th><th>HBM (for T_mem)</th><th>Network (for T_comms)</th></tr>
+  <tr><td>role</td><td>memory &harr; chip</td><td>chip &harr; chip</td></tr>
+  <tr><td>TPU v5e</td><td>~819 GB/s</td><td>ICI ~tens-hundreds GB/s</td></tr>
+  <tr><td>GPU H100</td><td>~3.35 TB/s</td><td>NVLink ~900 GB/s (in-node)<br>InfiniBand ~50-100 GB/s (cross-node)</td></tr>
+  <tr><td>speed</td><td class="dB" style="color:var(--good)">fast</td><td class="dF" style="color:var(--bad)">slower (esp. cross-node)</td></tr>
+</table>
+
+<div class="formula">
+op time &asymp; max( <b style="color:var(--compute)">T_math</b>, <b style="color:var(--memory)">T_mem</b>, <b style="color:var(--network)">T_comms</b> )
+<span class="note">(if they overlap; else the sum)</span>
+</div>
+
+<p>You are <span class="tag t-network">comms-bound</span> when you move too many bytes over the slow network relative to your FLOPs &mdash; the chips idle waiting on the interconnect, exactly like a memory-bound kernel waits on HBM. The comms bytes come from the parallelism strategy's collectives (data-parallel all-reduce, tensor-parallel all-gather, pipeline sends).</p>
+
+<!-- ============ recap ============ -->
+<h2>Recap in one screen</h2>
+<div class="card">
+  <p><span class="tag t-memory">bytes</span> matmul loads <code>2DF+2BD</code>, writes <code>2BF</code> &nbsp;(2 = bf16 size)</p>
+  <p><span class="tag t-compute">FLOPs</span> matmul does <code>2BDF</code> &nbsp;(2 = mul+add per MAC)</p>
+  <p><span class="tag t-good">intensity</span> = FLOPs/bytes = <code>BDF/(BD+DF+BF)</code> &asymp; <b>B</b></p>
+  <p><span class="dB" style="font-weight:700">B</span> = tokens (your choice) &middot; <span class="dD" style="font-weight:700">D,F</span> = model dims (fixed &gt;8000)</p>
+  <p><b>B &gt; 240 tokens</b> per replica &rarr; compute-bound (GPU ~300)</p>
+  <p><span class="tag t-memory">T_mem</span> uses HBM bandwidth &middot; <span class="tag t-network">T_comms</span> uses NETWORK bandwidth</p>
+  <p>op time &asymp; max(T_math, T_mem, T_comms)</p>
+</div>
+
+<p class="note" style="margin-top:30px;text-align:center">Notes on the JAX Scaling Book roofline chapter </p>
+
+</div>
+</body>
+</html>
