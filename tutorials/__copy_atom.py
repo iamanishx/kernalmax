@@ -46,8 +46,8 @@ Run:  python3 tutorials/__copy_atom.py
 import cuda.bindings.driver as cuda
 import cupy as cp
 import cutlass
-import cutlass.cute as cute
 import numpy as np
+from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 
 N = 1024

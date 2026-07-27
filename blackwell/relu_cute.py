@@ -1,9 +1,7 @@
 import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-
 import torch
-
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 TPB = 256
 

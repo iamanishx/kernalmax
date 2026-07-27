@@ -1,11 +1,9 @@
-import cutlass
-import cutlass.cute as cute
-import cutlass.cute.nvgpu.cpasync as cpasync
-from cutlass.cute.runtime import from_dlpack
-
-import torch
 import cuda.bindings.driver as cuda
-
+import cutlass
+import torch
+from cutlass import cute
+from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.runtime import from_dlpack
 
 M = N = K = 128
 BM = BN = 16          # output tile

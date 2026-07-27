@@ -1,13 +1,12 @@
 import math
-import cutlass
-import cutlass.cute as cute
-import cutlass.cute.nvgpu.warp as warp
-from cutlass.cute.runtime import from_dlpack
 
+import cuda.bindings.driver as cuda
+import cutlass
 import torch
 import torch.nn.functional as F
-import cuda.bindings.driver as cuda
-
+from cutlass import cute
+from cutlass.cute.nvgpu import warp
+from cutlass.cute.runtime import from_dlpack
 
 BH, S, D = 2, 128, 64
 BLK_M, BLK_N = 16, 16    
@@ -76,12 +75,10 @@ class FlashAttentionTC:
                 bmax = cutlass.Float32(NEG)
                 for j in cutlass.range(BLK_N):
                     s = sS[(tid, j)] * scale
-                    if s > bmax:
-                        bmax = s
+                    bmax = max(bmax, s)
                 mold = sm[tid]
                 mnew = mold
-                if bmax > mnew:
-                    mnew = bmax
+                mnew = max(mnew, bmax)
                 alpha = cute.arch.exp(mold - mnew)          # rescale factor
                 bl = cutlass.Float32(0.0)
                 for j in cutlass.range(BLK_N):

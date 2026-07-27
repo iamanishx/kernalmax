@@ -1,17 +1,16 @@
 import time
-from typing import Tuple
-import cupy as cp
-import numpy as np
 
+import cupy as cp
 import cutlass
-import cutlass.cute as cute
-from cutlass.cute import from_dlpack
+from cutlass import cute
 from cutlass.backend import utils
+from cutlass.cute import from_dlpack
+
 
 class SGemm:
     def __init__(
         self,
-        cta_tiler: Tuple[int, int, int] = (64, 64, 32),
+        cta_tiler: tuple[int, int, int] = (64, 64, 32),
         num_stages: int = 3,
         num_threads: int = 128,
     ):
@@ -432,7 +431,6 @@ class SGemm:
         numIterN = cute.size(tCrC, mode=[2])
         atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mC.element_type)
         cute.copy(atom, tCrC, tCgC, pred=predC)
-        return
 
 def main():
     M, N, K = 256, 256, 256

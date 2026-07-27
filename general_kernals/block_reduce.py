@@ -1,5 +1,5 @@
 import cutlass
-import cutlass.cute as cute
+from cutlass import cute
 
 NEG_INF = -3.4e38
 
@@ -14,8 +14,7 @@ def block_reduce_max(val: cutlass.Float32, red: cute.Tensor,
     offset = 16
     while offset > 0:
         o = cute.arch.shuffle_sync_down(val, offset)
-        if o > val:
-            val = o
+        val = max(val, o)
         offset //= 2
     if lane == 0:
         red[warp] = val
@@ -27,8 +26,7 @@ def block_reduce_max(val: cutlass.Float32, red: cute.Tensor,
         offset = 16
         while offset > 0:
             o = cute.arch.shuffle_sync_down(x, offset)
-            if o > x:
-                x = o
+            x = max(x, o)
             offset //= 2
         if lane == 0:
             red[0] = x

@@ -1,9 +1,8 @@
 import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-
 import torch
-import torch.nn as nn
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
+from torch import nn
 
 
 @cute.kernel
@@ -14,10 +13,10 @@ def rms_norm_kernel(mX: cute.Tensor, mW: cute.Tensor, mY: cute.Tensor,
                     epsilon: cutlass.Constexpr):
     allocator = cutlass.utils.SmemAllocator()
     sdata = allocator.allocate_tensor(cutlass.Float32,
-                                      cute.make_layout((threads_per_block)),
+                                      cute.make_layout(threads_per_block),
                                       byte_alignment=16, swizzle=None)
     squared_reduce = allocator.allocate_tensor(cutlass.Float32,
-                                               cute.make_layout((1)))
+                                               cute.make_layout(1))
 
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
