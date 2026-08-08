@@ -91,3 +91,9 @@ MAX_THREADS_PER_SM: int = 1536
 
 # For persistent scheduling: one CTA per SM
 PERSISTENT_GRID: int = NUM_SMS
+
+# attention scale 1/sqrt(head_dim)
+import math as _m
+
+SCALE: float = 1.0 / _m.sqrt(HEAD_DIM)
+MAX_SEQ_CACHE: int = 512  # KV cache capacity

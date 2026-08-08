@@ -1,41 +1,34 @@
 """
-Qwen2.5-0.5B PERSISTENT MEGAKERNEL — full 24-layer decode in ONE launch,
-across all 20 SMs of an RTX 4050.
+Qwen2.5-0.5B PERSISTENT MEGAKERNEL with KV cache — end-to-end prompting.
+
+Full 24-layer forward pass in ONE launch across all 20 SMs. Supports:
+  * arbitrary prompts (prefill token-by-token, filling the KV cache)
+  * autoregressive generation at any position
+  * real GQA attention with online softmax over the cache
 
 ARCHITECTURE
 ------------
-grid = [NUM_CTAS] (= #SMs) so every SM holds one resident CTA for the whole
-forward pass. There are no kernel boundaries: 24 layers + LM head run inside a
-single launch.
+grid = [NUM_CTAS] (= #SMs), block = [512] → 320 warps grid-wide, all resident.
 
 Work split:
   * Big GEMVs (Q/K/V/O/gate/up/down/lm_head) — split by output row across all
-    320 warps in the grid. Results land in GLOBAL memory; a grid_barrier
-    follows so every CTA sees the complete vector.
-  * Small ops (rmsnorm/rope/gqa) — computed REDUNDANTLY by each CTA in its own
-    SMEM. 896 elements of duplicate math is far cheaper than a barrier.
+    320 warps; results → global memory; grid_barrier after.
+  * Small ops (rmsnorm/RoPE) — computed redundantly per CTA in its own SMEM
+    (896 elements of duplicate math beats a barrier).
+  * Attention — one warp per Q head, split across CTAs, online softmax.
 
-Cross-CTA sync uses an atomic counter in global memory (sync_threads only works
-*within* a CTA). Safe because grid <= #SMs guarantees all CTAs are co-resident.
+`position` and `seq_len` are RUNTIME values (read from a tensor), so the same
+compiled kernel serves every step of prefill and decode — compiled once, reused.
 
-Optimizations applied:
-  1. warp-per-row GEMV      → coalesced weight loads (was 32x uncoalesced)
-  2. bf16 big weights       → halves HBM bytes on a bandwidth-bound decode
-  3. 512 threads/CTA        → 16 warps, more memory requests in flight
-  4. persistent 20-CTA grid → uses all SMs instead of 1
-  5. fused gate+up+SiLU     → one pass, one SMEM buffer instead of two
-
-Correctness: matches HuggingFace top-1 on every token tested.
-
-NOTE: Q/K are computed and RoPE'd but unused at seq_len=1 (softmax over a
-single key = 1, so attention output = V). Kept for structural correctness and
-because a KV-cache version needs them.
-
-Usage:  python megakernel.py
+Usage:
+    python3 megakernel.py "Your prompt here" [max_new_tokens] [temperature]
+    python3 megakernel.py --validate      # correctness checks vs HuggingFace
 """
 
 import math
 import os
+import sys
+import time
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -46,6 +39,7 @@ from config import (
     HEAD_DIM,
     HIDDEN_DIM,
     KV_DIM,
+    MAX_SEQ_CACHE,
     NUM_CTAS,
     NUM_LAYERS,
     NUM_THREADS,
@@ -59,8 +53,9 @@ from ops import (
     g2s,
     gemv_bias_mc,
     gemv_residual_mc,
-    gqa_decode_first,
+    gqa_attention,
     grid_barrier,
+    kv_cache_write,
     lm_head_mc,
     mlp_gate_silu_mc,
     rmsnorm,
@@ -71,19 +66,22 @@ from ops import (
 THREADS = NUM_THREADS
 BARRIERS_PER_LAYER = 4
 
+# Instruct model: follows chat templates and emits <|im_end|> so generation
+# terminates cleanly. The base model rambles — not supported here.
+MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
+
 
 class Qwen25Megakernel:
     @cute.kernel
-    def kernel(self, mTok, mEmb, mRope,
+    def kernel(self, mTok, mPos, mEmb, mRope,
                w_rms1, w_q, b_q, w_k, b_k, w_v, b_v, w_o, w_rms2,
                w_gate, w_up, w_down, w_fnorm, w_lm,
-               gH, gQ, gK, gV, gG, gBar, mLogits,
-               position: cutlass.Constexpr, n_layers: cutlass.Constexpr):
+               gH, gQ, gK, gV, gG, gKC, gVC, gBar, mLogits,
+               n_layers: cutlass.Constexpr):
         tid, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
         smem = cutlass.utils.SmemAllocator()
 
-        # per-CTA SMEM working set (~35 KB of the ~99 KB budget)
         sH = smem.allocate_tensor(cutlass.Float32, cute.make_layout(HIDDEN_DIM), byte_alignment=16)
         sN = smem.allocate_tensor(cutlass.Float32, cute.make_layout(HIDDEN_DIM), byte_alignment=16)
         sQ = smem.allocate_tensor(cutlass.Float32, cute.make_layout(Q_DIM), byte_alignment=16)
@@ -93,9 +91,12 @@ class Qwen25Megakernel:
         sG = smem.allocate_tensor(cutlass.Float32, cute.make_layout(FFN_INTERMEDIATE), byte_alignment=16)
         sR = smem.allocate_tensor(cutlass.Float32, cute.make_layout(32), byte_alignment=16)
 
-        # ── embedding: every CTA loads the token row into its own SMEM, and
-        #    all CTAs write the same values to gH (idempotent, no race) ──
+        # runtime position / sequence length
         token = mTok[0]
+        position = mPos[0]
+        seq_len = position + cutlass.Int32(1)
+
+        # ── embedding (all CTAs write identical values to gH) ──
         for i in cutlass.range(tid, HIDDEN_DIM, THREADS):
             e = mEmb[(token, i)].to(cutlass.Float32)
             sH[i] = e
@@ -105,12 +106,11 @@ class Qwen25Megakernel:
         for layer in cutlass.range_constexpr(n_layers):
             base = layer * BARRIERS_PER_LAYER + 1
 
-            # everyone refreshes its SMEM copy of the hidden state
             g2s(gH, sH, tid, HIDDEN_DIM)
             cute.arch.sync_threads()
 
-            # ═══ attention ═══
-            rmsnorm(sH, w_rms1, sN, sR, tid, layer, HIDDEN_DIM)   # redundant
+            # ═══ attention block ═══
+            rmsnorm(sH, w_rms1, sN, sR, tid, layer, HIDDEN_DIM)
             cute.arch.sync_threads()
 
             gemv_bias_mc(sN, w_q, b_q, gQ, tid, cta, layer, HIDDEN_DIM, HIDDEN_DIM)
@@ -123,18 +123,26 @@ class Qwen25Megakernel:
             g2s(gV, sV, tid, KV_DIM)
             cute.arch.sync_threads()
 
-            rope(sQ, sK, mRope, tid, position)                     # redundant
+            rope(sQ, sK, mRope, tid, position)
             cute.arch.sync_threads()
-            gqa_decode_first(sV, sA, tid)                          # redundant
+
+            # Each CTA writes the FULL KV row itself (redundant, identical
+            # values) so it only needs to see its own write — no grid barrier.
+            kv_cache_write(sK, sV, gKC, gVC, tid, layer, position)
+            cute.arch.sync_threads()
+
+            # real GQA + online softmax over cache[0 .. seq_len-1].
+            # Redundant per CTA because sA is per-CTA SMEM.
+            gqa_attention(sQ, gKC, gVC, sA, tid, layer, seq_len)
             cute.arch.sync_threads()
 
             gemv_residual_mc(sA, w_o, gH, tid, cta, layer, HIDDEN_DIM, HIDDEN_DIM)
             grid_barrier(gBar, tid, base + 2, NUM_CTAS)
 
-            # ═══ MLP ═══
+            # ═══ MLP block ═══
             g2s(gH, sH, tid, HIDDEN_DIM)
             cute.arch.sync_threads()
-            rmsnorm(sH, w_rms2, sN, sR, tid, layer, HIDDEN_DIM)    # redundant
+            rmsnorm(sH, w_rms2, sN, sR, tid, layer, HIDDEN_DIM)
             cute.arch.sync_threads()
 
             mlp_gate_silu_mc(sN, w_gate, w_up, gG, tid, cta, layer,
@@ -150,157 +158,326 @@ class Qwen25Megakernel:
         # ═══ final norm + LM head ═══
         g2s(gH, sH, tid, HIDDEN_DIM)
         cute.arch.sync_threads()
-        rmsnorm_final(sH, w_fnorm, sN, sR, tid, HIDDEN_DIM)        # redundant
+        rmsnorm_final(sH, w_fnorm, sN, sR, tid, HIDDEN_DIM)
         cute.arch.sync_threads()
         lm_head_mc(sN, w_lm, mLogits, tid, cta, HIDDEN_DIM, VOCAB_SIZE)
 
     @cute.jit
-    def __call__(self, mTok, mEmb, mRope,
+    def __call__(self, mTok, mPos, mEmb, mRope,
                  w_rms1, w_q, b_q, w_k, b_k, w_v, b_v, w_o, w_rms2,
                  w_gate, w_up, w_down, w_fnorm, w_lm,
-                 gH, gQ, gK, gV, gG, gBar, mLogits, stream: cuda.CUstream,
-                 position: cutlass.Constexpr = 0,
+                 gH, gQ, gK, gV, gG, gKC, gVC, gBar, mLogits,
+                 stream: cuda.CUstream,
                  n_layers: cutlass.Constexpr = NUM_LAYERS):
-        # NOTE: Constexpr args must come from defaults, never after `stream`
-        # in the call tuple — doing so silently corrupts the launch.
-        self.kernel(mTok, mEmb, mRope,
+        # NOTE: Constexpr args come from defaults — never pass them positionally
+        # after `stream`, that silently corrupts the launch.
+        self.kernel(mTok, mPos, mEmb, mRope,
                     w_rms1, w_q, b_q, w_k, b_k, w_v, b_v, w_o, w_rms2,
                     w_gate, w_up, w_down, w_fnorm, w_lm,
-                    gH, gQ, gK, gV, gG, gBar, mLogits,
-                    position, n_layers).launch(
+                    gH, gQ, gK, gV, gG, gKC, gVC, gBar, mLogits,
+                    n_layers).launch(
             grid=[NUM_CTAS, 1, 1], block=[THREADS, 1, 1], stream=stream)
 
 
-# ═══════════════════════════ host ═══════════════════════════
+# ═══════════════════════════ engine wrapper ═══════════════════════════
 
-def build_rope_table(max_seq, device="cuda"):
-    t = torch.zeros(max_seq, HALF, 2, device=device, dtype=torch.float32)
-    for pair in range(HALF):
-        theta = 1.0 / (ROPE_THETA ** (2.0 * pair / HEAD_DIM))
-        for pos in range(max_seq):
-            t[pos, pair, 0] = math.cos(theta * pos)
-            t[pos, pair, 1] = math.sin(theta * pos)
-    return t
+BARRIERS_TOTAL = NUM_LAYERS * BARRIERS_PER_LAYER + 1
 
 
-def _load_hf(model_id="Qwen/Qwen2.5-0.5B"):
-    from transformers import AutoModelForCausalLM
-    m = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32,
-                                             local_files_only=True).eval()
-    sd = {k: v.detach().clone() for k, v in m.named_parameters()}
+class MegakernelEngine:
+    """Compile once, then prefill + generate with a persistent KV cache."""
 
-    def st(key):
-        return torch.stack([sd[key.format(i)] for i in range(NUM_LAYERS)])
+    def __init__(self, model_id=MODEL_ID, bf16=True, verbose=True):
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        self.dev = torch.device("cuda")
+        self.verbose = verbose
 
-    W = {
-        "rms1": st("model.layers.{}.input_layernorm.weight").unsqueeze(1),
-        "q":    st("model.layers.{}.self_attn.q_proj.weight"),
-        "bq":   st("model.layers.{}.self_attn.q_proj.bias").unsqueeze(1),
-        "k":    st("model.layers.{}.self_attn.k_proj.weight"),
-        "bk":   st("model.layers.{}.self_attn.k_proj.bias").unsqueeze(1),
-        "v":    st("model.layers.{}.self_attn.v_proj.weight"),
-        "bv":   st("model.layers.{}.self_attn.v_proj.bias").unsqueeze(1),
-        "o":    st("model.layers.{}.self_attn.o_proj.weight"),
-        "rms2": st("model.layers.{}.post_attention_layernorm.weight").unsqueeze(1),
-        "gate": st("model.layers.{}.mlp.gate_proj.weight"),
-        "up":   st("model.layers.{}.mlp.up_proj.weight"),
-        "down": st("model.layers.{}.mlp.down_proj.weight"),
-        "embed": sd["model.embed_tokens.weight"],
-        "fnorm": sd["model.norm.weight"].unsqueeze(0),
-        "lm":   sd.get("lm_head.weight", sd["model.embed_tokens.weight"]),
-    }
-    return W, m
+        if verbose:
+            print(f"[1] loading weights: {model_id}")
+        hf = AutoModelForCausalLM.from_pretrained(
+            model_id, dtype=torch.float32, local_files_only=True).eval()
+        self.tok = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
+        sd = {k: v.detach().clone() for k, v in hf.named_parameters()}
+        self.hf = hf
 
+        # Robust stop-token set. Qwen chat ends a turn with <|im_end|>, which is
+        # NOT eos_token_id on the BASE model — without this the model rambles.
+        stops = set()
+        for tokstr in ("<|im_end|>", "<|endoftext|>"):
+            i = self.tok.convert_tokens_to_ids(tokstr)
+            if isinstance(i, int) and i >= 0:
+                stops.add(i)
+        for i in (self.tok.eos_token_id, self.tok.pad_token_id):
+            if isinstance(i, int) and i >= 0:
+                stops.add(i)
+        self.stop_ids = stops
 
-def main():
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    print("=" * 62)
-    print("Qwen2.5-0.5B PERSISTENT Megakernel — 24 layers, 1 launch")
-    print("=" * 62)
-    props = torch.cuda.get_device_properties(0)
-    print(f"GPU: {props.name} | SMs: {props.multi_processor_count} | sm_{props.major}{props.minor}")
-    print(f"grid=[{NUM_CTAS}] block=[{THREADS}] → {NUM_CTAS*THREADS//32} warps total")
-    dev = torch.device("cuda")
+        def st(key):
+            return torch.stack([sd[key.format(i)] for i in range(NUM_LAYERS)])
 
-    print("\n[1] Loading HF weights (offline)...")
-    W, hf = _load_hf()
-    for k in W:
-        W[k] = W[k].to(dev).contiguous()
-    if os.environ.get("BF16", "1") == "1":
-        for k in ["q", "k", "v", "o", "gate", "up", "down", "embed", "lm"]:
-            W[k] = W[k].to(torch.bfloat16).contiguous()
-    gb = sum(v.numel() * v.element_size() for v in W.values()) / 1024**3
-    print(f"    weight bytes: {gb:.2f} GB "
-          f"({'bf16 big / fp32 norms' if os.environ.get('BF16','1')=='1' else 'fp32'})")
+        W = {
+            "rms1": st("model.layers.{}.input_layernorm.weight").unsqueeze(1),
+            "q":    st("model.layers.{}.self_attn.q_proj.weight"),
+            "bq":   st("model.layers.{}.self_attn.q_proj.bias").unsqueeze(1),
+            "k":    st("model.layers.{}.self_attn.k_proj.weight"),
+            "bk":   st("model.layers.{}.self_attn.k_proj.bias").unsqueeze(1),
+            "v":    st("model.layers.{}.self_attn.v_proj.weight"),
+            "bv":   st("model.layers.{}.self_attn.v_proj.bias").unsqueeze(1),
+            "o":    st("model.layers.{}.self_attn.o_proj.weight"),
+            "rms2": st("model.layers.{}.post_attention_layernorm.weight").unsqueeze(1),
+            "gate": st("model.layers.{}.mlp.gate_proj.weight"),
+            "up":   st("model.layers.{}.mlp.up_proj.weight"),
+            "down": st("model.layers.{}.mlp.down_proj.weight"),
+            "embed": sd["model.embed_tokens.weight"],
+            "fnorm": sd["model.norm.weight"].unsqueeze(0),
+            "lm":   sd.get("lm_head.weight", sd["model.embed_tokens.weight"]),
+        }
+        for k in W:
+            W[k] = W[k].to(self.dev).contiguous()
+        if bf16:
+            for k in ["q", "k", "v", "o", "gate", "up", "down", "embed", "lm"]:
+                W[k] = W[k].to(torch.bfloat16).contiguous()
+        self.W = W
+        self.weight_bytes = sum(v.numel() * v.element_size() for v in W.values())
 
-    print("[2] RoPE table + global activation buffers...")
-    rope_t = build_rope_table(128, dev)
-    z = lambda n: torch.zeros(n, device=dev, dtype=torch.float32)
-    gH, gQ, gK, gV, gG = z(HIDDEN_DIM), z(Q_DIM), z(KV_DIM), z(KV_DIM), z(FFN_INTERMEDIATE)
-    gBar = torch.zeros(1, device=dev, dtype=torch.int32)
-    mLogits = torch.zeros(1, VOCAB_SIZE, device=dev, dtype=torch.float32)
-    mTok = torch.zeros(1, device=dev, dtype=torch.int32)
+        # rope table + activation buffers + KV cache
+        self.rope_t = self._rope_table(MAX_SEQ_CACHE)
+        z = lambda *s: torch.zeros(*s, device=self.dev, dtype=torch.float32)
+        self.gH, self.gQ = z(HIDDEN_DIM), z(Q_DIM)
+        self.gK, self.gV = z(KV_DIM), z(KV_DIM)
+        self.gG = z(FFN_INTERMEDIATE)
+        self.gKC = z(NUM_LAYERS, MAX_SEQ_CACHE, KV_DIM)
+        self.gVC = z(NUM_LAYERS, MAX_SEQ_CACHE, KV_DIM)
+        self.gBar = torch.zeros(1, device=self.dev, dtype=torch.int32)
+        self.mLogits = z(1, VOCAB_SIZE)
+        self.mTok = torch.zeros(1, device=self.dev, dtype=torch.int32)
+        self.mPos = torch.zeros(1, device=self.dev, dtype=torch.int32)
 
-    def ct(t): return from_dlpack(t, assumed_align=16)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    mk = Qwen25Megakernel()
+        kv_mb = (self.gKC.numel() + self.gVC.numel()) * 4 / 1024**2
+        if verbose:
+            print(f"    weights {self.weight_bytes/1024**3:.2f} GB"
+                  f"{' (bf16 big)' if bf16 else ' (fp32)'}, KV cache {kv_mb:.0f} MB")
+            print("[2] compiling megakernel...")
 
-    print("[3] Compiling...")
-    import time
-    t0 = time.time()
-    args = (ct(mTok), ct(W["embed"]), ct(rope_t),
+        ct = lambda t: from_dlpack(t, assumed_align=16)
+        self.stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        self.args = (
+            ct(self.mTok), ct(self.mPos), ct(W["embed"]), ct(self.rope_t),
             ct(W["rms1"]), ct(W["q"]), ct(W["bq"]), ct(W["k"]), ct(W["bk"]),
             ct(W["v"]), ct(W["bv"]), ct(W["o"]),
             ct(W["rms2"]), ct(W["gate"]), ct(W["up"]), ct(W["down"]),
             ct(W["fnorm"]), ct(W["lm"]),
-            ct(gH), ct(gQ), ct(gK), ct(gV), ct(gG), ct(gBar), ct(mLogits), stream)
-    compiled = cute.compile(mk, *args)
-    print(f"    compiled in {time.time()-t0:.1f}s")
+            ct(self.gH), ct(self.gQ), ct(self.gK), ct(self.gV), ct(self.gG),
+            ct(self.gKC), ct(self.gVC), ct(self.gBar), ct(self.mLogits),
+            self.stream,
+        )
+        t0 = time.time()
+        self.compiled = cute.compile(Qwen25Megakernel(), *self.args)
+        if verbose:
+            print(f"    compiled in {time.time()-t0:.1f}s "
+                  f"({BARRIERS_TOTAL} grid barriers)")
 
-    def run(tok):
-        # barrier counter must restart at 0 for every launch
-        gBar.zero_()
-        mTok[0] = tok
-        compiled(*args)
+    @staticmethod
+    def _rope_table(max_seq):
+        t = torch.zeros(max_seq, HALF, 2, device="cuda", dtype=torch.float32)
+        for pair in range(HALF):
+            theta = 1.0 / (ROPE_THETA ** (2.0 * pair / HEAD_DIM))
+            for pos in range(max_seq):
+                t[pos, pair, 0] = math.cos(theta * pos)
+                t[pos, pair, 1] = math.sin(theta * pos)
+        return t
 
-    print("\n[4] Correctness vs HuggingFace (first token, position 0)...")
+    def reset(self):
+        """Clear the KV cache for a new conversation."""
+        self.gKC.zero_()
+        self.gVC.zero_()
+
+    def step(self, token_id, position):
+        """One forward pass. Appends K/V at `position`, returns logits [VOCAB]."""
+        self.gBar.zero_()                 # barrier counter restarts each launch
+        self.mTok[0] = token_id
+        self.mPos[0] = position
+        self.compiled(*self.args)
+        return self.mLogits[0]
+
+    def prefill(self, token_ids):
+        """Feed the prompt token-by-token, filling the cache. Returns last logits."""
+        logits = None
+        for pos, t in enumerate(token_ids):
+            logits = self.step(int(t), pos)
+        torch.cuda.synchronize()
+        return logits
+
+    @torch.no_grad()
+    def generate(self, prompt, max_new_tokens=40, temperature=0.0, top_k=50,
+                 chat=True, stream_out=True):
+        """Prefill the prompt then sample autoregressively. Returns the text."""
+        if chat:
+            enc = self.tok.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                add_generation_prompt=True, tokenize=True)
+            # transformers may return a list, a dict, or a BatchEncoding
+            if isinstance(enc, dict) or hasattr(enc, "input_ids"):
+                ids = enc["input_ids"]
+            else:
+                ids = enc
+            if len(ids) and isinstance(ids[0], (list, tuple)):
+                ids = ids[0]
+            ids = [int(t) for t in ids]
+        else:
+            ids = [int(t) for t in self.tok(prompt)["input_ids"]]
+
+        if len(ids) + max_new_tokens > MAX_SEQ_CACHE:
+            max_new_tokens = MAX_SEQ_CACHE - len(ids)
+
+        self.reset()
+        t0 = time.time()
+        logits = self.prefill(ids)
+        t_prefill = time.time() - t0
+
+        out_ids, pos = [], len(ids)
+        t0 = time.time()
+        for _ in range(max_new_tokens):
+            if temperature <= 0.0:
+                nxt = int(logits.argmax().item())
+            else:
+                lg = logits.float() / temperature
+                if top_k:
+                    v, ix = lg.topk(min(top_k, lg.numel()))
+                    probs = torch.softmax(v, dim=-1)
+                    nxt = int(ix[torch.multinomial(probs, 1)].item())
+                else:
+                    nxt = int(torch.multinomial(torch.softmax(lg, -1), 1).item())
+
+            if nxt in self.stop_ids:
+                break
+            out_ids.append(nxt)
+            if stream_out:
+                print(self.tok.decode([nxt]), end="", flush=True)
+
+            logits = self.step(nxt, pos)
+            pos += 1
+            if pos >= MAX_SEQ_CACHE:
+                break
+        torch.cuda.synchronize()
+        t_decode = time.time() - t0
+        if stream_out:
+            print()
+
+        n = max(len(out_ids), 1)
+        return {
+            "text": self.tok.decode(out_ids),
+            "n_prompt": len(ids),
+            "n_new": len(out_ids),
+            "prefill_s": t_prefill,
+            "decode_s": t_decode,
+            "prefill_tok_s": len(ids) / t_prefill if t_prefill else 0.0,
+            "decode_tok_s": n / t_decode if t_decode else 0.0,
+        }
+
+
+# ═══════════════════════════ validation + demo ═══════════════════════════
+
+def validate(eng, n_pos=6):
+    """Check our logits against HF across several positions (tests KV cache)."""
+    print("\n[3] correctness vs HuggingFace across positions...")
+    ids = eng.tok("The capital of France is Paris, and the capital of Italy is")["input_ids"]
+    ids = [int(t) for t in ids][:n_pos]
+    eng.reset()
+    hf_out = eng.hf(torch.tensor([ids]))          # full-sequence HF reference
     npass = 0
-    toks = [42, 100, 1000, 5000, 12345]
-    for tok in toks:
-        run(tok)
+    for pos, t in enumerate(ids):
+        our = eng.step(int(t), pos)
         torch.cuda.synchronize()
-        with torch.no_grad():
-            ref = hf(torch.tensor([[tok]])).logits[0, -1, :]
-        our = mLogits[0].cpu()
-        err = (our - ref).abs().max().item()
-        ok = our.argmax().item() == ref.argmax().item()
+        ref = hf_out.logits[0, pos, :]
+        ok = our.cpu().argmax().item() == ref.argmax().item()
+        err = (our.cpu() - ref).abs().max().item()
         npass += ok
-        print(f"    tok={tok:6d}: top-1 {'OK ' if ok else 'X  '} "
-              f"max_err={err:.3e}  ours={our.argmax().item()} hf={ref.argmax().item()}")
-    print(f"    → {npass}/{len(toks)} top-1 match")
+        print(f"    pos={pos} tok={t:6d}: top-1 {'OK ' if ok else 'X  '} "
+              f"max_err={err:.3e}  ours={our.cpu().argmax().item()} hf={ref.argmax().item()}")
+    print(f"    → {npass}/{len(ids)} positions match "
+          f"({'KV cache + online softmax CORRECT' if npass==len(ids) else 'MISMATCH'})")
+    return npass == len(ids)
 
-    print("\n[5] Benchmark...")
-    def bench(fn, it=30):
-        for _ in range(5):
-            fn()
-        torch.cuda.synchronize()
-        s = torch.cuda.Event(enable_timing=True)
-        e = torch.cuda.Event(enable_timing=True)
-        s.record()
-        for _ in range(it):
-            fn()
-        e.record()
-        torch.cuda.synchronize()
-        return s.elapsed_time(e) / it * 1000
 
-    us = bench(lambda: run(42))
-    weight_bytes = sum(v.numel() * v.element_size() for v in W.values())
-    achieved = weight_bytes / (us * 1e-6) / 1e9
-    print(f"    megakernel:      {us:9.1f} us/token")
-    print(f"    effective BW:    {achieved:9.1f} GB/s  "
-          f"(4050 peak ~216 GB/s → {achieved/216*100:.0f}% of peak)")
-    print(f"    HBM floor:       {weight_bytes/216e9*1e6:9.1f} us "
-          f"(if perfectly bandwidth-bound)")
+def validate_generation(eng, prompt="The capital of France is", n=20):
+    """Definitive end-to-end test: our greedy generation vs HF's, token-for-token."""
+    print(f"\n[4] end-to-end greedy generation vs HF ('{prompt}', {n} tokens)...")
+    ids = [int(t) for t in eng.tok(prompt)["input_ids"]]
+
+    # ours
+    eng.reset()
+    logits = eng.prefill(ids)
+    ours, pos = [], len(ids)
+    for _ in range(n):
+        nxt = int(logits.argmax().item())
+        ours.append(nxt)
+        logits = eng.step(nxt, pos)
+        pos += 1
+
+    # HF greedy
+    with torch.no_grad():
+        hf_ids = eng.hf.generate(torch.tensor([ids]), max_new_tokens=n,
+                                 do_sample=False,
+                                 pad_token_id=eng.tok.eos_token_id)
+    theirs = [int(t) for t in hf_ids[0][len(ids):]]
+
+    # find first divergence and report how close that decision was
+    first_div = next((i for i, (a, b) in enumerate(zip(ours, theirs)) if a != b), None)
+    if first_div is not None:
+        eng.reset()
+        lg = eng.prefill(ids)
+        for t in ours[:first_div]:
+            lg = eng.step(t, len(ids) + ours[:first_div].index(t))
+        top2 = lg.float().topk(2)
+        gap = (top2.values[0] - top2.values[1]).item()
+        print(f"    first divergence at token {first_div}: "
+              f"top-2 logit gap = {gap:.4f}  "
+              f"({'NEAR-TIE → bf16 rounding' if gap < 0.1 else 'large gap → real bug'})")
+
+    match = sum(a == b for a, b in zip(ours, theirs))
+    print(f"    ours  : {eng.tok.decode(ours)!r}")
+    print(f"    HF    : {eng.tok.decode(theirs)!r}")
+    print(f"    → {match}/{len(theirs)} tokens identical "
+          f"({'EXACT MATCH' if match == len(theirs) else 'divergence'})")
+    return match == len(theirs)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        print("\nusage: python3 megakernel.py \"your prompt\" [max_new_tokens] [temperature]")
+        print("       python3 megakernel.py --validate      # correctness checks only")
+        sys.exit(0 if args else 1)
+
+    validate_only = args[0] == "--validate"
+    prompt = None if validate_only else args[0]
+    max_new = int(args[1]) if len(args) > 1 and not validate_only else 128
+    temp = float(args[2]) if len(args) > 2 and not validate_only else 0.0
+
+    print("=" * 62)
+    print("Qwen2.5-0.5B-Instruct Megakernel — prefill + decode, KV cache")
+    print("=" * 62)
+    p = torch.cuda.get_device_properties(0)
+    print(f"GPU: {p.name} | SMs: {p.multi_processor_count} | sm_{p.major}{p.minor}")
+    print(f"grid=[{NUM_CTAS}] block=[{THREADS}] -> {NUM_CTAS*THREADS//32} warps\n")
+
+    eng = MegakernelEngine()
+
+    if validate_only:
+        validate(eng)
+        print(f"    stop tokens: {sorted(eng.stop_ids)}")
+        validate_generation(eng)
+        return
+
+    print(f"\n{'='*62}\nPROMPT: {prompt}\n{'-'*62}")
+    r = eng.generate(prompt, max_new_tokens=max_new, temperature=temp)
+    print(f"{'-'*62}")
+    print(f"prompt {r['n_prompt']} tok | generated {r['n_new']} tok")
+    print(f"prefill {r['prefill_s']*1000:.0f} ms ({r['prefill_tok_s']:.1f} tok/s) | "
+          f"decode {r['decode_s']*1000:.0f} ms ({r['decode_tok_s']:.1f} tok/s)")
 
 
 if __name__ == "__main__":

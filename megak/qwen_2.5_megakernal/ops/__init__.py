@@ -1,10 +1,4 @@
-"""Modular @cute.jit ops for the Qwen2.5-0.5B persistent megakernel.
-
-@cute.jit is required so runtime grid-stride loops get AST-preprocessed
-(plain Python functions don't — see ../GOTCHAS.md §1.7).
-"""
-
-from ops.attention import gqa_decode_first, rope
+from ops.attention import gqa_attention, kv_cache_write, rope
 from ops.matmul import (
     g2s,
     gemv_bias_mc,
@@ -20,8 +14,9 @@ __all__ = [
     "g2s",
     "gemv_bias_mc",
     "gemv_residual_mc",
-    "gqa_decode_first",
+    "gqa_attention",
     "grid_barrier",
+    "kv_cache_write",
     "lm_head_mc",
     "mlp_gate_silu_mc",
     "rmsnorm",
