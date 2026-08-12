@@ -1,5 +1,3 @@
-"""RMSNorm — @cute.jit, direct SMEM indexing, grid-stride."""
-
 import cutlass
 from config import NUM_THREADS, RMS_NORM_EPS
 from cutlass import cute

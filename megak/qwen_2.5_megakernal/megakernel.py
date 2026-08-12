@@ -1,30 +1,3 @@
-"""
-Qwen2.5-0.5B PERSISTENT MEGAKERNEL with KV cache — end-to-end prompting.
-
-Full 24-layer forward pass in ONE launch across all 20 SMs. Supports:
-  * arbitrary prompts (prefill token-by-token, filling the KV cache)
-  * autoregressive generation at any position
-  * real GQA attention with online softmax over the cache
-
-ARCHITECTURE
-------------
-grid = [NUM_CTAS] (= #SMs), block = [512] → 320 warps grid-wide, all resident.
-
-Work split:
-  * Big GEMVs (Q/K/V/O/gate/up/down/lm_head) — split by output row across all
-    320 warps; results → global memory; grid_barrier after.
-  * Small ops (rmsnorm/RoPE) — computed redundantly per CTA in its own SMEM
-    (896 elements of duplicate math beats a barrier).
-  * Attention — one warp per Q head, split across CTAs, online softmax.
-
-`position` and `seq_len` are RUNTIME values (read from a tensor), so the same
-compiled kernel serves every step of prefill and decode — compiled once, reused.
-
-Usage:
-    python3 megakernel.py "Your prompt here" [max_new_tokens] [temperature]
-    python3 megakernel.py --validate      # correctness checks vs HuggingFace
-"""
-
 import math
 import os
 import sys
@@ -62,6 +35,8 @@ from ops import (
     rmsnorm_final,
     rope,
 )
+from prefill_megakernel import BM as PF_BM
+from prefill_megakernel import PrefillMegakernel
 
 THREADS = NUM_THREADS
 BARRIERS_PER_LAYER = 4
@@ -179,14 +154,12 @@ class Qwen25Megakernel:
             grid=[NUM_CTAS, 1, 1], block=[THREADS, 1, 1], stream=stream)
 
 
-# ═══════════════════════════ engine wrapper ═══════════════════════════
 
 BARRIERS_TOTAL = NUM_LAYERS * BARRIERS_PER_LAYER + 1
 
 
 class MegakernelEngine:
-    """Compile once, then prefill + generate with a persistent KV cache."""
-
+    
     def __init__(self, model_id=MODEL_ID, bf16=True, verbose=True):
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -195,6 +168,7 @@ class MegakernelEngine:
 
         if verbose:
             print(f"[1] loading weights: {model_id}")
+        # fp32 copy ONLY for exact weight extraction; dropped after to save VRAM.
         hf = AutoModelForCausalLM.from_pretrained(
             model_id, dtype=torch.float32, local_files_only=True).eval()
         self.tok = AutoTokenizer.from_pretrained(model_id, local_files_only=True)
@@ -233,6 +207,10 @@ class MegakernelEngine:
             "fnorm": sd["model.norm.weight"].unsqueeze(0),
             "lm":   sd.get("lm_head.weight", sd["model.embed_tokens.weight"]),
         }
+        del hf            # free the fp32 reference model (~2.5 GB)
+        import gc; gc.collect()
+        self.hf_bf16 = None        # built lazily on first batched prefill
+        self._model_id = model_id
         for k in W:
             W[k] = W[k].to(self.dev).contiguous()
         if bf16:
@@ -289,12 +267,18 @@ class MegakernelEngine:
         return t
 
     def reset(self):
-        """Clear the KV cache for a new conversation."""
         self.gKC.zero_()
         self.gVC.zero_()
 
+    def _maybe_log_mem(self, where):
+        if os.environ.get("MEMLOG") == "1":
+            a = torch.cuda.memory_allocated() / 1024**3
+            r = torch.cuda.memory_reserved() / 1024**3
+            print(f"    [mem:{where}] alloc={a:.2f}GB reserved={r:.2f}GB")
+
     def step(self, token_id, position):
         """One forward pass. Appends K/V at `position`, returns logits [VOCAB]."""
+        self._maybe_log_mem("step")
         self.gBar.zero_()                 # barrier counter restarts each launch
         self.mTok[0] = token_id
         self.mPos[0] = position
@@ -302,22 +286,102 @@ class MegakernelEngine:
         return self.mLogits[0]
 
     def prefill(self, token_ids):
-        """Feed the prompt token-by-token, filling the cache. Returns last logits."""
         logits = None
         for pos, t in enumerate(token_ids):
             logits = self.step(int(t), pos)
         torch.cuda.synchronize()
         return logits
 
+    def _get_prefill_model(self):
+        if self.hf_bf16 is None:
+            from transformers import AutoModelForCausalLM
+            self.hf_bf16 = AutoModelForCausalLM.from_pretrained(
+                self._model_id, dtype=torch.bfloat16,
+                local_files_only=True).cuda().eval()
+        return self.hf_bf16
+
+    def _build_prefill(self, M):
+        """Compile the prefill megakernel for a padded length M (cached per M)."""
+        if not hasattr(self, "_pf"):
+            self._pf = {}
+        if M in self._pf:
+            return self._pf[M]
+        dev = self.dev
+        z = lambda *sh: torch.zeros(*sh, device=dev, dtype=torch.float32)
+        b = dict(
+            gH=z(M, HIDDEN_DIM), gX=z(M, HIDDEN_DIM), gQ=z(M, Q_DIM),
+            gK=z(M, KV_DIM), gV=z(M, KV_DIM), gA=z(M, HIDDEN_DIM),
+            gGu=z(M, FFN_INTERMEDIATE), gUp=z(M, FFN_INTERMEDIATE),
+            mToks=torch.zeros(M, device=dev, dtype=torch.int32),
+            mMreal=torch.zeros(1, device=dev, dtype=torch.int32),
+        )
+        W = self.W
+        ct = lambda t: from_dlpack(t, assumed_align=16)
+        args = (ct(b["mToks"]), ct(W["embed"]), ct(self.rope_t),
+                ct(W["rms1"]), ct(W["q"]), ct(W["bq"]), ct(W["k"]), ct(W["bk"]),
+                ct(W["v"]), ct(W["bv"]), ct(W["o"]), ct(W["rms2"]),
+                ct(W["gate"]), ct(W["up"]), ct(W["down"]),
+                ct(W["fnorm"]), ct(W["lm"]),
+                ct(b["gH"]), ct(b["gX"]), ct(b["gQ"]), ct(b["gK"]), ct(b["gV"]),
+                ct(b["gA"]), ct(b["gGu"]), ct(b["gUp"]),
+                ct(self.gKC), ct(self.gVC), ct(self.gBar), ct(self.mLogits),
+                ct(b["mMreal"]), self.stream)
+        if self.verbose:
+            print(f"[3] compiling PREFILL megakernel (M={M})...")
+        t0 = time.time()
+        compiled = cute.compile(PrefillMegakernel(), *args, M=M)
+        if self.verbose:
+            print(f"    compiled in {time.time()-t0:.0f}s")
+        self._pf[M] = (compiled, args, b)
+        return self._pf[M]
+
+    @torch.no_grad()
+    def prefill_mk(self, token_ids):
+        """PREFILL MEGAKERNEL: whole prompt in ONE launch. Fills KV cache,
+        returns logits [VOCAB] for the first generated token."""
+        n = len(token_ids)
+        M = ((n + PF_BM - 1) // PF_BM) * PF_BM
+        compiled, args, b = self._build_prefill(M)
+        b["mToks"].zero_()
+        b["mToks"][:n] = torch.tensor(token_ids, device=self.dev, dtype=torch.int32)
+        b["mMreal"][0] = n
+        self.gBar.zero_()
+        compiled(*args)
+        torch.cuda.synchronize()
+        return self.mLogits[0]
+
+    @torch.no_grad()
+    def prefill_batched(self, token_ids):
+        """Batched prefill: one HF forward pass over the whole prompt, then copy
+        the resulting K/V into our megakernel cache. Returns logits [VOCAB].
+
+        The win vs token-by-token: weights are read ONCE for all M tokens
+        (a GEMM) instead of M times (M GEMVs). See .agents/megakernel.md —
+        prefill is bandwidth-bound at small L, so read-once is the whole game.
+        """
+        n = len(token_ids)
+        ids = torch.tensor([token_ids], device=self.dev)
+        out = self._get_prefill_model()(ids, use_cache=True)
+        logits = out.logits[0, -1].float()          # [VOCAB]
+        # transformers>=5 DynamicCache: pkv.layers[l].keys is [1, n_kv, seq, hd].
+        # Flatten the 2 KV heads into [seq, KV_DIM] to match our cache layout.
+        for layer in range(NUM_LAYERS):
+            L = out.past_key_values.layers[layer]
+            k = L.keys[0].transpose(0, 1).reshape(n, KV_DIM)    # [seq, KV_DIM]
+            v = L.values[0].transpose(0, 1).reshape(n, KV_DIM)
+            self.gKC[layer, :n] = k.float()
+            self.gVC[layer, :n] = v.float()
+        torch.cuda.synchronize()
+        return logits
+
     @torch.no_grad()
     def generate(self, prompt, max_new_tokens=40, temperature=0.0, top_k=50,
-                 chat=True, stream_out=True):
-        """Prefill the prompt then sample autoregressively. Returns the text."""
+                 chat=True, stream_out=True, fast_prefill=True):
+
         if chat:
             enc = self.tok.apply_chat_template(
                 [{"role": "user", "content": prompt}],
                 add_generation_prompt=True, tokenize=True)
-            # transformers may return a list, a dict, or a BatchEncoding
             if isinstance(enc, dict) or hasattr(enc, "input_ids"):
                 ids = enc["input_ids"]
             else:
@@ -333,7 +397,7 @@ class MegakernelEngine:
 
         self.reset()
         t0 = time.time()
-        logits = self.prefill(ids)
+        logits = self.prefill_mk(ids) if fast_prefill else self.prefill(ids)
         t_prefill = time.time() - t0
 
         out_ids, pos = [], len(ids)
