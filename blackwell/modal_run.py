@@ -68,6 +68,16 @@ def gemm():
     _run("matmul_tcgen05_sm100.py")
 
 
+@app.function(gpu=GPU, image=image, timeout=240)
+def gemm_min():
+    _run("matmul_tcgen05_minimal.py")
+
+
+@app.function(gpu=GPU, image=image, timeout=240)
+def gemm_min_plainop():
+    _run("matmul_tcgen05_minimal_plainop.py")
+
+
 @app.function(gpu=GPU, image=image, timeout=180)
 def relu():
     _run("relu_cute.py")
@@ -75,7 +85,7 @@ def relu():
 
 @app.local_entrypoint()
 def main(task: str = "all"):
-    tasks = {"all": all_tests, "check": check, "tma": tma, "gemm": gemm, "relu": relu}
+    tasks = {"all": all_tests, "check": check, "tma": tma, "gemm": gemm, "gemm_min": gemm_min, "gemm_min_plainop": gemm_min_plainop, "relu": relu}
     if task in tasks:
         tasks[task].remote()
     else:
