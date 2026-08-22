@@ -29,12 +29,11 @@ tree you wrote in softmax_reduce_cute.py with something faster and barrier-free.
 Run:  python3 tutorials/__shfl_down_sync.py
 """
 
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-
+import cuda.bindings.driver as cuda
 import cupy as cp
 import numpy as np
-import cuda.bindings.driver as cuda
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 WARP = 32
 
@@ -52,8 +51,7 @@ class WarpReduce:
             v = v + cute.arch.shuffle_sync_down(v, offset)
 
             other = cute.arch.shuffle_sync_down(m, offset)
-            if other > m:
-                m = other
+            m = max(m, other)
 
             if lane == 0:
                 cute.printf("  after offset %2d : lane0 sum=%8.4f  max=%8.4f\n",

@@ -25,13 +25,12 @@ This tutorial shows two uses in one kernel:
                 version of the shuffle fold; here it works for any block size)
 """
 
-import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-
-import cupy as cp
-import numpy as np
 import cuda.bindings.driver as cuda
+import cupy as cp
+import cutlass
+import numpy as np
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 N = 256  
 

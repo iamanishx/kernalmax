@@ -2,13 +2,12 @@
 # exp_z = np.exp(shifted_z)
 # return exp_z / np.sum(exp_z)
 
-import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-
-import cupy as cp
-import numpy as np
 import cuda.bindings.driver as cuda
+import cupy as cp
+import cutlass
+import numpy as np
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 M, N = 1024, 1024
 THREADS = 256
@@ -49,8 +48,7 @@ class SoftmaxReduce:
         offset = 16
         while offset > 0:
             other = cute.arch.shuffle_sync_down(my_max, offset)
-            if other > my_max:
-                my_max = other
+            my_max = max(my_max, other)
             offset //= 2
 
         if lane == 0:
@@ -64,8 +62,7 @@ class SoftmaxReduce:
             offset = 16
             while offset > 0:
                 other = cute.arch.shuffle_sync_down(x, offset)
-                if other > x:
-                    x = other
+                x = max(x, other)
                 offset //= 2
             if lane == 0:
                 s[0] = x                                                   

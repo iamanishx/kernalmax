@@ -1,10 +1,9 @@
-import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-
-import cupy as cp
-import numpy as np
 import cuda.bindings.driver as cuda
+import cupy as cp
+import cutlass
+import numpy as np
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 # softmax(x_i) = exp(x_i - max_j x_j) / sum_k exp(x_k - max_j x_j)
 
@@ -22,8 +21,7 @@ class Softmax:
         m = mX[row, 0]
         for j in cutlass.range(N):
             v = mX[row, j]
-            if v > m:
-                m = v
+            m = max(m, v)
 
         denom = cutlass.Float32(0.0)
         for j in cutlass.range(N):

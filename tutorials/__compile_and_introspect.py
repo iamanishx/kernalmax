@@ -1,10 +1,9 @@
+import cupy as cp
 import cutlass
-import cutlass.cute as cute
+import numpy as np
+from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
 from cutlass.utils.layout import LayoutEnum
-
-import cupy as cp
-import numpy as np
 
 
 @cute.jit

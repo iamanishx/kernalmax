@@ -57,3 +57,4 @@ Thumbs.db
 /tmp/
 *.log
 *.tmp
+blackwell/matmul_tcgen05_sm100.py

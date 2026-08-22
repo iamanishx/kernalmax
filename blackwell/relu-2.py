@@ -1,5 +1,5 @@
 import cutlass
-import cutlass.cute as cute
+from cutlass import cute
 
 TPB = 256
 VEC = 4

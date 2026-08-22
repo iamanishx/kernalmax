@@ -1,16 +1,14 @@
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-
-import torch
 import cuda.bindings.driver as cuda
-
+import cutlass
+import torch
 from block_reduce import block_reduce_max, block_reduce_sum
-
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 BH, S, D = 2, 128, 64  
 BLK_N = D   
@@ -50,8 +48,7 @@ class FlashAttention:
 
             blk_max = block_reduce_max(s, red, tid, WARPS)
             m_new = m
-            if blk_max > m_new:
-                m_new = blk_max
+            m_new = max(m_new, blk_max)
             alpha = cute.exp(m - m_new)          # correction factor for old state
 
             p = cute.exp(s - m_new)              # softmax numerator

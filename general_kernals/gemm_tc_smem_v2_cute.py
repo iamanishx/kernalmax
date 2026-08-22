@@ -1,12 +1,10 @@
 
-import cutlass
-import cutlass.cute as cute
-import cutlass.cute.nvgpu.warp as warp
-from cutlass.cute.runtime import from_dlpack
-
-import torch
 import cuda.bindings.driver as cuda
-
+import cutlass
+import torch
+from cutlass import cute
+from cutlass.cute.nvgpu import warp
+from cutlass.cute.runtime import from_dlpack
 
 M, N, K = 256, 256, 256
 

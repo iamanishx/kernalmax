@@ -1,11 +1,10 @@
-import cutlass
-import cutlass.cute as cute
-import cutlass.cute.nvgpu.cpasync as cpasync
-from cutlass.cute.runtime import from_dlpack
-
-import cupy as cp
-import numpy as np
 import cuda.bindings.driver as cuda
+import cupy as cp
+import cutlass
+import numpy as np
+from cutlass import cute
+from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.runtime import from_dlpack
 
 N = 1024
 THREADS = 256

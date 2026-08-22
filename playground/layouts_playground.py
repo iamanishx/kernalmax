@@ -12,7 +12,7 @@ This drills the 8 concepts from cute_algebra.md. Layout(coord) = offset is the
 whole game; everything else is layouts built from layouts.
 """
 
-import cutlass.cute as cute
+from cutlass import cute
 
 
 @cute.jit

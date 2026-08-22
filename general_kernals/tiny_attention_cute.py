@@ -1,12 +1,10 @@
-import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-
-import cupy as cp
-import numpy as np
 import cuda.bindings.driver as cuda
+import cupy as cp
+import cutlass
+import numpy as np
 from block_reduce import block_reduce_max, block_reduce_sum
-
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 BH, S, D = 2, 128, 64
 THREADS = S
