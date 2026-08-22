@@ -514,16 +514,43 @@ W = {
 }
 <span class="k">del</span> hf  <span class="c"># free the reference model</span></code></pre>
     <p>
-      <code>torch.stack</code> turns 40 per-layer matrices <code>[N, K]</code> into one
-      contiguous <code>[L, N, K]</code> tensor. This is the right thing to do for a
-      megakernel (one pointer, one layout, the layer index is just the outermost
+      <code>torch.stack</code> turns 48 per-layer matrices <code>[N, K]</code> into one
+      contiguous <code>[L, N, K]</code> tensor, and the engine does this once per weight
+      type, so one layer's seven matrices become seven stacked tensors. This is the
+      right thing to do for a megakernel (one pointer, one layout, the layer index is just the outermost
       coordinate), and it is also <strong>exactly where the oversized tensor is
       created</strong>:
     </p>
-<pre><code>w_gate = w_up = [48, 13824, 5120] bf16   =  <span class="n">5.66 GB</span> each
-w_down        = [48, 5120, 13824] bf16   =  <span class="n">5.66 GB</span>
+<pre><code>w_gate = w_up = [48, 13824, 5120] bf16   =  <span class="n">6.79 GB</span> each
+w_down        = [48, 5120, 13824] bf16   =  <span class="n">6.79 GB</span>
 
 layer stride in BYTES = 13824 &middot; 5120 &middot; 2 = <span class="n">141,557,760</span></code></pre>
+
+    <figure class="figure" id="stack-figure">
+      <svg viewBox="0 0 760 280" role="img" aria-label="Animated diagram: each of the 48 transformer layers owns seven matrices (q, k, v, o, gate, up, down). torch.stack runs once per weight type, producing seven stacked tensors, one per type.">
+        <text x="30" y="46" class="fig-text">checkpoint: 48 layers &times; 7 matrices each</text>
+        <rect x="30" y="58" width="172" height="192" fill="none" stroke="#d9d0bb"/>
+        <text x="24" y="80" text-anchor="end" class="fig-text">L0</text>
+        <text x="24" y="246" text-anchor="end" class="fig-text">L47</text>
+        <g id="stack-src"></g>
+        <text x="219" y="140" text-anchor="middle" class="fig-text">stack</text>
+        <text x="500" y="46" text-anchor="middle" class="fig-text">one stacked tensor per weight type</text>
+        <g id="stack-slices"></g>
+        <g id="stack-labels"></g>
+        <g id="stack-fly"></g>
+      </svg>
+      <div class="fig-readout">
+        <div><span class="fig-label">layers stacked</span><span id="stk-layer">0 / 48</span></div>
+        <div><span class="fig-label">gate slab shape</span><span id="stk-shape">[0, 13824, 5120]</span></div>
+        <div><span class="fig-label">weights stacked</span><span id="stk-size">0.00 GB</span></div>
+        <div><span class="fig-label">weight objects</span><span id="stk-copies">336 matrices</span></div>
+        <div class="fig-state" id="stk-state">each layer owns 7 private matrices + 2 norm vectors + biases</div>
+      </div>
+      <div class="fig-foot">
+        <figcaption><strong>Fig. 1.</strong> One layer is not one matrix, it is seven (<code>q, k, v, o, gate, up, down</code>) plus two RMSNorm vectors and q/k/v biases. <code>st()</code> runs once per weight type, so 48 layers become <strong>seven stacked tensors</strong>: layer L is slice L in all of them. <code>gate/up/down</code> are the 6.79 GB giants that later get split (&sect;5); <code>q/o</code> are 2.52 GB; <code>k/v</code> only 0.50 GB (GQA). Counting norms, biases, embed and lm_head, VRAM holds 18 weight objects, not 336.</figcaption>
+        <button class="fig-replay" id="stk-replay" type="button">Replay</button>
+      </div>
+    </figure>
     <p>
       At 0.5B the largest stacked tensor is <code>[24, 4864, 896]</code> bf16 = 209&nbsp;MB,
       27&times; under the limit. Nothing was ever going to go wrong there, which is why the
@@ -693,7 +720,7 @@ address = base + offset        64-bit GEP: receives already-wrapped garbage</cod
         <div class="fig-state" id="fig-state">offset under 2&#179;&#178;: addressing is safe</div>
       </div>
       <div class="fig-foot">
-        <figcaption><strong>Fig. 1.</strong> The offset grows 141.5&nbsp;MB per layer. Past 2<sup>32</sup> the 32-bit computation wraps to near-zero garbage while the intended 64-bit offset keeps climbing; the read lands in unmapped memory and the MMU raises FAULT_PDE.</figcaption>
+        <figcaption><strong>Fig. 2.</strong> The offset grows 141.5&nbsp;MB per layer. Past 2<sup>32</sup> the 32-bit computation wraps to near-zero garbage while the intended 64-bit offset keeps climbing; the read lands in unmapped memory and the MMU raises FAULT_PDE.</figcaption>
         <button class="fig-replay" id="fig-replay" type="button">Replay</button>
       </div>
     </figure>
@@ -1143,6 +1170,136 @@ DECODE: 26.42 ms/token → <span class="n">37.9 tok/s</span> (951 GB/s achieved)
       }, { threshold: .4 });
       fo.observe(fig);
     } else { render(TOTAL); }
+  }
+
+  /* ---------- Fig. 1: one layer = 7 matrices, one stack per weight type ---------- */
+  var sfig = document.getElementById('stack-figure');
+  if (sfig) {
+    var SN = 48;
+    var WT = [                            // name, per-layer bytes (bf16)
+      ['q',    5120 * 5120 * 2],
+      ['k',    1024 * 5120 * 2],
+      ['v',    1024 * 5120 * 2],
+      ['o',    5120 * 5120 * 2],
+      ['gate', 13824 * 5120 * 2],
+      ['up',   13824 * 5120 * 2],
+      ['down', 13824 * 5120 * 2]
+    ];
+    var NW = WT.length;
+    var LAYER_BYTES = 0;
+    WT.forEach(function(w){ LAYER_BYTES += w[1]; });   // 550,502,400 B per layer
+    var SVGNS = 'http://www.w3.org/2000/svg';
+    var srcG = document.getElementById('stack-src');
+    var slcG = document.getElementById('stack-slices');
+    var labG = document.getElementById('stack-labels');
+    var flyG = document.getElementById('stack-fly');
+    var sLayer = document.getElementById('stk-layer');
+    var sShape = document.getElementById('stk-shape');
+    var sSize = document.getElementById('stk-size');
+    var sCopies = document.getElementById('stk-copies');
+    var sState = document.getElementById('stk-state');
+    var sbtn = document.getElementById('stk-replay');
+    function sy(i){ return 74 + i * 3.55; }      // source row y (checkpoint)
+    function dy(i){ return 228 - i * 3.55; }     // slab slice top y
+    function sgx(j){ return 44 + j * 20; }       // segment x inside a source row
+    function sbx(j){ return 236 + j * 72; }      // slab x
+    function mkRect(g, x, y, w, h, fill){
+      var r = document.createElementNS(SVGNS, 'rect');
+      r.setAttribute('x', x); r.setAttribute('y', y.toFixed(1));
+      r.setAttribute('width', w); r.setAttribute('height', h);
+      r.setAttribute('fill', fill);
+      g.appendChild(r);
+      return r;
+    }
+    // left: 48 rows, each split into 7 segments (the layer's 7 matrices)
+    var srcs = [];
+    for (var i0 = 0; i0 < SN; i0++) {
+      var row = [];
+      for (var j1 = 0; j1 < NW; j1++) row.push(mkRect(srcG, sgx(j1), sy(i0), 18, 2.2, '#b3a98f'));
+      srcs.push(row);
+    }
+    // right: 7 slabs of 48 slices, plus ground line + name/size labels
+    var slcs = [];
+    for (var j2 = 0; j2 < NW; j2++) {
+      var col = [];
+      for (var i1 = 0; i1 < SN; i1++) {
+        var s = mkRect(slcG, sbx(j2), dy(i1), 62, 2.6, '#0e7355');
+        s.setAttribute('opacity', 0);
+        col.push(s);
+      }
+      slcs.push(col);
+      var gl = document.createElementNS(SVGNS, 'line');
+      gl.setAttribute('x1', sbx(j2)); gl.setAttribute('x2', sbx(j2) + 62);
+      gl.setAttribute('y1', 233); gl.setAttribute('y2', 233);
+      gl.setAttribute('stroke', '#7a7261'); gl.setAttribute('stroke-width', '1');
+      slcG.appendChild(gl);
+      var t1 = document.createElementNS(SVGNS, 'text');
+      t1.setAttribute('x', sbx(j2) + 31); t1.setAttribute('y', 250);
+      t1.setAttribute('text-anchor', 'middle'); t1.setAttribute('class', 'fig-text');
+      t1.textContent = WT[j2][0];
+      labG.appendChild(t1);
+      var t2 = document.createElementNS(SVGNS, 'text');
+      t2.setAttribute('x', sbx(j2) + 31); t2.setAttribute('y', 262);
+      t2.setAttribute('text-anchor', 'middle'); t2.setAttribute('class', 'fig-text');
+      t2.textContent = Math.round(WT[j2][1] / 1e6) + 'MB/L';
+      labG.appendChild(t2);
+    }
+    // 7 flying slices, one per weight type
+    var flys = [];
+    for (var j3 = 0; j3 < NW; j3++) {
+      var f0 = mkRect(flyG, 0, 0, 14, 2.4, '#0a5c44');
+      f0.setAttribute('opacity', 0);
+      flys.push(f0);
+    }
+    function srender(f){
+      var done = Math.min(Math.floor(f), SN);
+      var local = f - Math.floor(f);
+      for (var i = 0; i < SN; i++) {
+        var col = i < done ? '#d8d0bc' : (i === done ? '#0a5c44' : '#b3a98f');
+        for (var j = 0; j < NW; j++) {
+          srcs[i][j].setAttribute('fill', col);
+          slcs[j][i].setAttribute('opacity', (i < done || (i === done && local >= .95)) ? '.55' : 0);
+        }
+      }
+      if (local >= .25 && local < .95 && done < SN) {
+        for (var j4 = 0; j4 < NW; j4++) {
+          var e = (local - .25) / .7; e = e * e * (3 - 2 * e);
+          flys[j4].setAttribute('x', (sgx(j4) + 2 + (sbx(j4) + 24 - sgx(j4) - 2) * e).toFixed(1));
+          flys[j4].setAttribute('y', (sy(done) + (dy(done) - sy(done)) * e).toFixed(1));
+          flys[j4].setAttribute('opacity', '.9');
+        }
+      } else {
+        for (var j5 = 0; j5 < NW; j5++) flys[j5].setAttribute('opacity', 0);
+      }
+      sLayer.textContent = done + ' / ' + SN;
+      sShape.textContent = '[' + done + ', 13824, 5120]';
+      sSize.textContent = (done * LAYER_BYTES / 1e9).toFixed(2) + ' GB';
+      sCopies.textContent = done >= SN ? '7 tensors' : (SN - done) * NW + ' matrices loose';
+      sState.textContent = done >= SN
+        ? 'each weight type is one tensor: layer L is slice L in all seven. q/k/v/o stay whole; gate/up/down get split in half (\u00A75). Plus norms, biases, embed, lm_head: 18 weight objects in VRAM.'
+        : 'layer ' + done + ' contributes 7 slices, one per stack (' + Math.round(LAYER_BYTES / 1e6) + ' MB of weights per layer)';
+    }
+    var sraf = null, sstart = null, SDUR = 7200;
+    function sstep(ts){
+      if (sstart === null) sstart = ts;
+      var t = Math.min((ts - sstart) / SDUR, 1);
+      srender(t * SN);
+      if (t < 1) sraf = requestAnimationFrame(sstep);
+    }
+    function splay(){
+      if (sraf) cancelAnimationFrame(sraf);
+      if (reduce) { srender(SN); return; }
+      sstart = null;
+      sraf = requestAnimationFrame(sstep);
+    }
+    sbtn.addEventListener('click', splay);
+    if (reduce) { srender(SN); }
+    else if ('IntersectionObserver' in window) {
+      var so = new IntersectionObserver(function(en){
+        if (en[0].isIntersecting) { splay(); so.disconnect(); }
+      }, { threshold: .4 });
+      so.observe(sfig);
+    } else { srender(SN); }
   }
 })();
 </script>
